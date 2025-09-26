@@ -1376,5 +1376,5 @@ void loop() {
   if (millis() - lastUpdate > 100) {
     lastUpdate = millis();
     updateDisplay();
-  }
+  }
 }
