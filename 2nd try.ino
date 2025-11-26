@@ -1,3 +1,7 @@
+
+// 192.168.4.1 pe ip adress web interface dikh hi nahi raha 
+// mene evil win to kr diya hai but run krke dekhna padega abbb (tesitng )
+
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
